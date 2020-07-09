@@ -37,6 +37,7 @@ from urllib.parse import urlparse
 import unicodedata
 import re
 import xml.etree.ElementTree as etree
+from dateutil import parser as date_parser
 
 
 class writeable_dir(argparse.Action):
@@ -61,6 +62,8 @@ class PodcastArchiver:
     _headers = {'User-Agent': _userAgent}
     _global_info_keys = ['author', 'language', 'link', 'subtitle', 'title', ]
     _episode_info_keys = ['author', 'link', 'subtitle', 'title', ]
+    _episode_number_keys = ['itunes_episode', ]
+    _season_number_keys = ['itunes_season', ]
     _date_keys = ['published', ]
 
     savedir = ''
@@ -99,6 +102,9 @@ class PodcastArchiver:
         self.progress = args.progress
         self.slugify = args.slugify
         self.maximumEpisodes = args.max_episodes or None
+        self.episodePadding = args.episode_padding or None
+        self.seasonPadding = args.season_padding or None
+        self.nameFromMetadata = args.name_from_metadata or None
 
         if self.verbose > 1:
             print("Verbose level: ", self.verbose)
@@ -146,16 +152,79 @@ class PodcastArchiver:
 
     def slugifyString(filename):
         filename = unicodedata.normalize('NFKD', filename).encode('ascii', 'ignore')
-        filename = re.sub('[^\w\s\-\.]', '', filename.decode('ascii')).strip()
-        filename = re.sub('[-\s]+', '-', filename)
+        filename = re.sub('[^\w\s\.\-:,]', '', filename.decode('ascii')).strip()
+        filename = re.sub('[\s]+', ' ', filename)
+        filename = '.'.join([s.strip() for s in filename.rsplit('.', 1)])
 
         return filename
 
-    def linkToTargetFilename(self, link, must_have_ext=False):
+    def linkToTargetFilename(self, link, must_have_ext=False, episode_dict=None):
 
         # Remove HTTP GET parameters from filename by parsing URL properly
         linkpath = urlparse(link).path
         basename = path.basename(linkpath)
+        if episode_dict is not None:
+            metaname = []
+
+            # publish time
+            published = episode_dict.get('published', None)
+            if published:
+                try:
+                    published_date = date_parser.parse(published)
+                    metaname.append(published_date.strftime('%Y_%m_%d'))
+                except Exception as e:
+                    print('Failed to parse published date: %s, %s' % (published, e))
+
+            # season number
+            season_number = episode_dict.get('season', None)
+            if season_number is not None:
+                season_number = str(season_number).rjust(self.seasonPadding, '0')
+                # metaname.append(season_number)
+
+            # episode number
+            episode_number = episode_dict.get('episode', None)
+            if episode_number is not None:
+                episode_number = str(episode_number).rjust(self.episodePadding, '0')
+                # metaname.append(episode_number)
+
+            # episode name
+            episode_name = episode_dict.get('title', None)
+            if episode_name is not None:
+                if episode_number is None:
+                    # checking if maybe we have the episode number in the name...
+                    m = re.search('Ep\. ([0-9]+)', episode_name)
+                    if m:
+                        episode_number = m.group(1).rjust(self.episodePadding, '0')
+                        # metaname.append(episode_number)
+                        episode_name = re.sub('Ep\. [0-9]+', '', episode_name)
+                episode_name = re.sub('^SinCast - ', '', episode_name)
+                episode_name = re.sub('^C[0-9]+E[0-9]+ ', '', episode_name)
+                if episode_name.endswith(' - Bonus Episode!'):
+                    episode_number = 'BONUS'
+                    episode_name = re.sub(' - Bonus Episode!$', '', episode_name)
+                episode_name = '{}.{}' .format(episode_name.strip(), basename.split('.')[-1])
+            # else:
+            #     metaname.append(basename)
+
+            if season_number is not None:
+                if episode_number is not None:
+                    metaname.append('S{}E{}'.format(season_number, episode_number))
+                else:
+                    metaname.append('S{}'.format(season_number))
+            elif episode_number is not None:
+                metaname.append(episode_number)
+            metaname.append(episode_name)
+
+            basename = ' - '.join(metaname)
+
+
+
+        #     basename = '{}{}{}'.format(
+
+        #     )
+        # if 'redcircle.com' in link and basename == 'stream.mp3':
+        #     # https://stream.redcircle.com/episodes/85264a6b-d8eb-4148-aa09-eac2c68fd83a/stream.mp3
+        #     basename = '%s.%s' % (linkpath.split('/')[-2], basename.split('.')[-1])
 
         _, ext = path.splitext(basename)
         if must_have_ext and not ext:
@@ -223,8 +292,21 @@ class PodcastArchiver:
                 if url is not None:
                     for key in self._episode_info_keys + self._date_keys:
                         episode_info[key] = episode.get(key, None)
-                    episode_info['url'] = url
 
+                    episode_info['episode'] = None
+                    for key in self._episode_number_keys:
+                        episode_number_candidate = episode.get(key, None)
+                        if episode_number_candidate:
+                            episode_info['episode'] = episode_number_candidate
+                            break
+
+                    episode_info['season'] = None
+                    for key in self._season_number_keys:
+                        season_number_candidate = episode.get(key, None)
+                        if season_number_candidate:
+                            episode_info['season'] = season_number_candidate
+                            break
+                    episode_info['url'] = url
         return episode_info
 
     def processPodcastLink(self, link):
@@ -271,7 +353,7 @@ class PodcastArchiver:
             if self.update:
                 for index, episode_dict in enumerate(linklist):
                     link = episode_dict['url']
-                    filename = self.linkToTargetFilename(link)
+                    filename = self.linkToTargetFilename(link, episode_dict=episode_dict if self.nameFromMetadata else None)
 
                     if path.isfile(filename):
                         del(linklist[index:])
@@ -325,7 +407,7 @@ class PodcastArchiver:
                         print("\t * %10s: %s" % (key, episode_dict[key]))
 
             # Check existence once ...
-            filename = self.linkToTargetFilename(link)
+            filename = self.linkToTargetFilename(link, episode_dict=episode_dict if self.nameFromMetadata else None)
 
             if self.verbose > 1:
                 print("\tLocal filename:", filename)
@@ -343,7 +425,7 @@ class PodcastArchiver:
                     # Check existence another time, with resolved link
                     link = response.geturl()
                     total_size = int(response.getheader('content-length', '0'))
-                    new_filename = self.linkToTargetFilename(link, must_have_ext=True)
+                    new_filename = self.linkToTargetFilename(link, must_have_ext=True, episode_dict=episode_dict if self.nameFromMetadata else None)
 
                     if new_filename and new_filename != filename:
                         filename = new_filename
@@ -423,6 +505,9 @@ if __name__ == "__main__":
         parser.add_argument('-m', '--max-episodes', type=int,
                             help='''Only download the given number of episodes per podcast
                                  feed. Useful if you don't really need the entire backlog.''')
+        parser.add_argument('--episode-padding', help='How to pad the episode numbers.', type=int, default=3)
+        parser.add_argument('--season-padding', help='How to pad the season numbers.', type=int, default=2)
+        parser.add_argument('--name-from-metadata', action='store_true', help='Use info in XML to name file instead of URL')
 
         args = parser.parse_args()
 
